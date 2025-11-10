@@ -4,10 +4,26 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+
+
+@pragma('vm:entry-point')
+void callbackDispatcher() {
+
+}
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final preferences = await SharedPreferences.getInstance();
+
+  if (!kIsWeb) {
+    try {
+      // Динамический импорт WorkManager только для не-Web платформ
+      print('WorkManager инициализация пропущена на Web');
+    } catch (e) {
+      print('WorkManager не доступен на этой платформе');
+    }
+  }
 
   runApp(
     MultiProvider(
@@ -157,7 +173,6 @@ class RecipeApiService {
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
         if (data['meals'] != null) {
-          // Берем только первые 10 рецептов для ускорения
           final meals = (data['meals'] as List).take(10);
           List<Recipe> recipes = [];
 
@@ -196,10 +211,8 @@ class RecipeApiService {
     }
   }
 
-  // Параллельные запросы вместо последовательных
   Future<List<Recipe>> getRandomRecipes({int count = 10}) async {
     try {
-      // Делаем все запросы параллельно
       final futures = List.generate(
         count,
             (_) => http.get(Uri.parse('$baseUrl/random.php'))
@@ -233,6 +246,7 @@ class RecipeViewModel extends ChangeNotifier {
   List<Recipe> _recipes = [];
   List<Recipe> _searchResults = [];
   List<Recipe> _favoriteRecipes = [];
+  Recipe? _recipeOfTheDay;
   bool _isLoading = false;
   String? _errorMessage;
   String _selectedCategory = 'All';
@@ -240,12 +254,14 @@ class RecipeViewModel extends ChangeNotifier {
   RecipeViewModel(this._preferences) {
     _selectedCategory = _preferences.getString('lastCategory') ?? 'All';
     _loadFavoritesFromPrefs();
+    _loadRecipeOfTheDay();
     loadRecipes();
   }
 
   List<Recipe> get recipes => _recipes;
   List<Recipe> get searchResults => _searchResults;
   List<Recipe> get favoriteRecipes => _favoriteRecipes;
+  Recipe? get recipeOfTheDay => _recipeOfTheDay;
   bool get isLoading => _isLoading;
   String? get errorMessage => _errorMessage;
   String get selectedCategory => _selectedCategory;
@@ -263,7 +279,6 @@ class RecipeViewModel extends ChangeNotifier {
     'Vegetarian',
   ];
 
-  // Используем SharedPreferences вместо SQLite потому что на Web нормально не работает
   void _loadFavoritesFromPrefs() {
     try {
       final favoritesJson = _preferences.getString('favorites');
@@ -276,6 +291,54 @@ class RecipeViewModel extends ChangeNotifier {
     } catch (e) {
       print('Error loading favorites: $e');
       _favoriteRecipes = [];
+    }
+  }
+
+  void _loadRecipeOfTheDay() {
+    try {
+      final recipeJson = _preferences.getString('recipe_of_the_day');
+      final dateStr = _preferences.getString('recipe_of_the_day_date');
+
+      if (recipeJson != null && dateStr != null) {
+        final savedDate = DateTime.parse(dateStr);
+        final now = DateTime.now();
+
+        if (savedDate.year == now.year &&
+            savedDate.month == now.month &&
+            savedDate.day == now.day) {
+          final recipeData = json.decode(recipeJson);
+          _recipeOfTheDay = Recipe.fromJsonStorage(recipeData);
+        } else {
+          // Если рецепт устарел, загружаем новый
+          _fetchNewRecipeOfTheDay();
+        }
+      } else {
+        // Если рецепта нет, загружаем новый
+        _fetchNewRecipeOfTheDay();
+      }
+    } catch (e) {
+      print('Error loading recipe of the day: $e');
+      _fetchNewRecipeOfTheDay();
+    }
+  }
+
+  // Загрузка нового рецепта дня
+  Future<void> _fetchNewRecipeOfTheDay() async {
+    try {
+      final recipes = await _apiService.getRandomRecipes(count: 1);
+      if (recipes.isNotEmpty) {
+        _recipeOfTheDay = recipes[0];
+        _recipeOfTheDay!.isFavorite = _isFavorite(_recipeOfTheDay!.id);
+
+        // Сохраняем в SharedPreferences
+        final recipeJson = json.encode(_recipeOfTheDay!.toJson());
+        await _preferences.setString('recipe_of_the_day', recipeJson);
+        await _preferences.setString('recipe_of_the_day_date', DateTime.now().toIso8601String());
+
+        notifyListeners();
+      }
+    } catch (e) {
+      print('Error fetching new recipe of the day: $e');
     }
   }
 
@@ -301,7 +364,6 @@ class RecipeViewModel extends ChangeNotifier {
 
     try {
       _recipes = await _apiService.getRandomRecipes(count: 10);
-
 
       for (var recipe in _recipes) {
         recipe.isFavorite = _isFavorite(recipe.id);
@@ -331,7 +393,6 @@ class RecipeViewModel extends ChangeNotifier {
         _recipes = await _apiService.getRecipesByCategory(category);
       }
 
-
       for (var recipe in _recipes) {
         recipe.isFavorite = _isFavorite(recipe.id);
       }
@@ -359,7 +420,6 @@ class RecipeViewModel extends ChangeNotifier {
     try {
       _searchResults = await _apiService.searchRecipes(query);
 
-
       for (var recipe in _searchResults) {
         recipe.isFavorite = _isFavorite(recipe.id);
       }
@@ -379,28 +439,35 @@ class RecipeViewModel extends ChangeNotifier {
   }
 
   Future<void> toggleFavorite(String recipeId) async {
-    Recipe? recipe;
+    Recipe? foundRecipe;
 
+    // Ищем рецепт во всех источниках
     try {
-      recipe = _recipes.firstWhere((r) => r.id == recipeId);
+      foundRecipe = _recipes.firstWhere((r) => r.id == recipeId);
     } catch (e) {
       try {
-        recipe = _searchResults.firstWhere((r) => r.id == recipeId);
+        foundRecipe = _searchResults.firstWhere((r) => r.id == recipeId);
       } catch (e) {
         try {
-          recipe = _favoriteRecipes.firstWhere((r) => r.id == recipeId);
+          foundRecipe = _favoriteRecipes.firstWhere((r) => r.id == recipeId);
         } catch (e) {
-          return;
+          if (_recipeOfTheDay?.id == recipeId) {
+            foundRecipe = _recipeOfTheDay;
+          }
         }
       }
     }
 
-    recipe.isFavorite = !recipe.isFavorite;
+    // Если рецепт не найден, выходим
+    if (foundRecipe == null) return;
 
-    if (recipe.isFavorite) {
-      _favoriteRecipes.add(recipe);
+    // Теперь foundRecipe точно не null, работаем с ним
+    foundRecipe.isFavorite = !foundRecipe.isFavorite;
+
+    if (foundRecipe.isFavorite) {
+      _favoriteRecipes.add(foundRecipe);
     } else {
-      _favoriteRecipes.removeWhere((r) => r.id == recipe!.id);
+      _favoriteRecipes.removeWhere((r) => r.id == foundRecipe!.id);
     }
 
     await _saveFavoritesToPrefs();
@@ -417,6 +484,9 @@ class RecipeViewModel extends ChangeNotifier {
         try {
           return _favoriteRecipes.firstWhere((r) => r.id == id);
         } catch (e) {
+          if (_recipeOfTheDay?.id == id) {
+            return _recipeOfTheDay;
+          }
           return null;
         }
       }
@@ -515,7 +585,7 @@ class RecipeBookApp extends StatelessWidget {
   }
 }
 
-// Main Navigation with Bottom Navigation Bar
+// Main Navigation
 class MainNavigationScreen extends StatefulWidget {
   const MainNavigationScreen({super.key});
 
@@ -575,15 +645,11 @@ class HomeScreen extends StatelessWidget {
         title: const Text('Recipe Book'),
         actions: [
           IconButton(
-            onPressed: () {
-              Navigator.pushNamed(context, '/search');
-            },
+            onPressed: () => Navigator.pushNamed(context, '/search'),
             icon: const Icon(Icons.search),
           ),
           IconButton(
-            onPressed: () {
-              Navigator.pushNamed(context, '/settings');
-            },
+            onPressed: () => Navigator.pushNamed(context, '/settings'),
             icon: const Icon(Icons.settings),
           ),
           Center(
@@ -600,6 +666,84 @@ class HomeScreen extends StatelessWidget {
       ),
       body: Column(
         children: [
+          // Recipe of the Day Banner
+          if (viewModel.recipeOfTheDay != null)
+            Container(
+              margin: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [
+                    Theme.of(context).colorScheme.primaryContainer,
+                    Theme.of(context).colorScheme.secondaryContainer,
+                  ],
+                ),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: InkWell(
+                onTap: () {
+                  Navigator.pushNamed(
+                    context,
+                    '/recipe',
+                    arguments: viewModel.recipeOfTheDay!.id,
+                  );
+                },
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Row(
+                    children: [
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: viewModel.recipeOfTheDay!.imageUrl != null
+                            ? CachedNetworkImage(
+                          imageUrl: viewModel.recipeOfTheDay!.imageUrl!,
+                          width: 60,
+                          height: 60,
+                          fit: BoxFit.cover,
+                        )
+                            : Container(
+                          width: 60,
+                          height: 60,
+                          color: Colors.grey[300],
+                          child: const Icon(Icons.restaurant),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Row(
+                              children: [
+                                Icon(Icons.star, size: 16, color: Colors.amber),
+                                SizedBox(width: 4),
+                                Text(
+                                  'Recipe of the Day',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              viewModel.recipeOfTheDay!.name,
+                              style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                              ),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ],
+                        ),
+                      ),
+                      const Icon(Icons.arrow_forward_ios, size: 16),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           // Category Filter
           SizedBox(
             height: 60,
@@ -615,9 +759,7 @@ class HomeScreen extends StatelessWidget {
                   child: FilterChip(
                     label: Text(category),
                     selected: isSelected,
-                    onSelected: (_) {
-                      viewModel.loadRecipesByCategory(category);
-                    },
+                    onSelected: (_) => viewModel.loadRecipesByCategory(category),
                   ),
                 );
               },
@@ -632,8 +774,7 @@ class HomeScreen extends StatelessWidget {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  const Icon(Icons.error_outline,
-                      size: 64, color: Colors.red),
+                  const Icon(Icons.error_outline, size: 64, color: Colors.red),
                   const SizedBox(height: 16),
                   Text(viewModel.errorMessage!),
                   const SizedBox(height: 16),
@@ -661,10 +802,7 @@ class HomeScreen extends StatelessWidget {
       child: ListView.builder(
         padding: const EdgeInsets.all(16),
         itemCount: viewModel.recipes.length,
-        itemBuilder: (context, index) {
-          final recipe = viewModel.recipes[index];
-          return RecipeCard(recipe: recipe);
-        },
+        itemBuilder: (context, index) => RecipeCard(recipe: viewModel.recipes[index]),
       ),
     );
   }
@@ -681,10 +819,7 @@ class HomeScreen extends StatelessWidget {
           mainAxisSpacing: 16,
         ),
         itemCount: viewModel.recipes.length,
-        itemBuilder: (context, index) {
-          final recipe = viewModel.recipes[index];
-          return RecipeCard(recipe: recipe);
-        },
+        itemBuilder: (context, index) => RecipeCard(recipe: viewModel.recipes[index]),
       ),
     );
   }
@@ -694,21 +829,14 @@ class HomeScreen extends StatelessWidget {
 class RecipeCard extends StatelessWidget {
   final Recipe recipe;
 
-  const RecipeCard({
-    super.key,
-    required this.recipe,
-  });
+  const RecipeCard({super.key, required this.recipe});
 
   Color _getDifficultyColor() {
     switch (recipe.difficulty) {
-      case 'Easy':
-        return Colors.green;
-      case 'Medium':
-        return Colors.orange;
-      case 'Hard':
-        return Colors.red;
-      default:
-        return Colors.grey;
+      case 'Easy': return Colors.green;
+      case 'Medium': return Colors.orange;
+      case 'Hard': return Colors.red;
+      default: return Colors.grey;
     }
   }
 
@@ -720,17 +848,10 @@ class RecipeCard extends StatelessWidget {
       margin: const EdgeInsets.only(bottom: 16),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
-        onTap: () {
-          Navigator.pushNamed(
-            context,
-            '/recipe',
-            arguments: recipe.id,
-          );
-        },
+        onTap: () => Navigator.pushNamed(context, '/recipe', arguments: recipe.id),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Image
             if (recipe.imageUrl != null)
               CachedNetworkImage(
                 imageUrl: recipe.imageUrl!,
@@ -752,11 +873,7 @@ class RecipeCard extends StatelessWidget {
               Container(
                 height: 200,
                 color: Theme.of(context).colorScheme.primaryContainer,
-                child: Icon(
-                  Icons.restaurant,
-                  size: 80,
-                  color: Theme.of(context).colorScheme.primary,
-                ),
+                child: Icon(Icons.restaurant, size: 80, color: Theme.of(context).colorScheme.primary),
               ),
             Padding(
               padding: const EdgeInsets.all(16),
@@ -771,24 +888,15 @@ class RecipeCard extends StatelessWidget {
                           children: [
                             Text(
                               recipe.name,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .titleLarge
-                                  ?.copyWith(
-                                fontWeight: FontWeight.bold,
-                              ),
+                              style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
                               maxLines: 2,
                               overflow: TextOverflow.ellipsis,
                             ),
                             const SizedBox(height: 4),
                             Text(
                               recipe.category,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
-                                  ?.copyWith(
-                                color:
-                                Theme.of(context).colorScheme.secondary,
+                              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                                color: Theme.of(context).colorScheme.secondary,
                               ),
                             ),
                           ],
@@ -797,9 +905,7 @@ class RecipeCard extends StatelessWidget {
                       IconButton(
                         onPressed: () => viewModel.toggleFavorite(recipe.id),
                         icon: Icon(
-                          recipe.isFavorite
-                              ? Icons.favorite
-                              : Icons.favorite_border,
+                          recipe.isFavorite ? Icons.favorite : Icons.favorite_border,
                           color: recipe.isFavorite ? Colors.red : null,
                         ),
                       ),
@@ -868,9 +974,7 @@ class _SearchScreenState extends State<SearchScreen> {
             hintText: 'Search recipes...',
             border: InputBorder.none,
           ),
-          onSubmitted: (value) {
-            viewModel.searchRecipes(value);
-          },
+          onSubmitted: (value) => viewModel.searchRecipes(value),
         ),
         actions: [
           IconButton(
@@ -889,17 +993,11 @@ class _SearchScreenState extends State<SearchScreen> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(
-              Icons.search,
-              size: 80,
-              color: Colors.grey[400],
-            ),
+            Icon(Icons.search, size: 80, color: Colors.grey[400]),
             const SizedBox(height: 16),
             Text(
               'Search for recipes',
-              style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                color: Colors.grey[600],
-              ),
+              style: Theme.of(context).textTheme.titleLarge?.copyWith(color: Colors.grey[600]),
             ),
           ],
         ),
@@ -907,10 +1005,7 @@ class _SearchScreenState extends State<SearchScreen> {
           : ListView.builder(
         padding: const EdgeInsets.all(16),
         itemCount: viewModel.searchResults.length,
-        itemBuilder: (context, index) {
-          final recipe = viewModel.searchResults[index];
-          return RecipeCard(recipe: recipe);
-        },
+        itemBuilder: (context, index) => RecipeCard(recipe: viewModel.searchResults[index]),
       ),
     );
   }
@@ -936,9 +1031,7 @@ class SettingsScreen extends StatelessWidget {
             subtitle: const Text('Enable dark theme'),
             value: settingsViewModel.isDarkMode,
             onChanged: (_) => settingsViewModel.toggleDarkMode(),
-            secondary: Icon(
-              settingsViewModel.isDarkMode ? Icons.dark_mode : Icons.light_mode,
-            ),
+            secondary: Icon(settingsViewModel.isDarkMode ? Icons.dark_mode : Icons.light_mode),
           ),
           const Divider(),
           SwitchListTile(
@@ -946,23 +1039,24 @@ class SettingsScreen extends StatelessWidget {
             subtitle: const Text('Display recipes in grid layout'),
             value: settingsViewModel.isGridView,
             onChanged: (_) => settingsViewModel.toggleGridView(),
-            secondary: Icon(
-              settingsViewModel.isGridView ? Icons.grid_view : Icons.view_list,
-            ),
+            secondary: Icon(settingsViewModel.isGridView ? Icons.grid_view : Icons.view_list),
           ),
           const Divider(),
           ListTile(
             leading: const Icon(Icons.info_outline),
             title: const Text('About'),
-            subtitle: const Text('Recipe Book v1.0.0 (Web)'),
+            subtitle: const Text('Recipe Book v1.1.0 (Unit 7 - Web)'),
             onTap: () {
               showAboutDialog(
                 context: context,
                 applicationName: 'Recipe Book',
-                applicationVersion: '1.0.0 (Web)',
+                applicationVersion: '1.1.0 (Unit 7 - Daily Recipe)',
                 applicationIcon: const Icon(Icons.restaurant_menu, size: 48),
-                children: [
-                  const Text('A beautiful recipe book application built with Flutter for Web'),
+                children: const [
+                  Text('A recipe book app with Recipe of the Day'),
+                  SizedBox(height: 8),
+                  Text('✓ Daily featured recipe'),
+                  Text('✓ Automatic recipe refresh'),
                 ],
               );
             },
@@ -977,10 +1071,7 @@ class SettingsScreen extends StatelessWidget {
 class RecipeDetailScreen extends StatelessWidget {
   final String recipeId;
 
-  const RecipeDetailScreen({
-    super.key,
-    required this.recipeId,
-  });
+  const RecipeDetailScreen({super.key, required this.recipeId});
 
   @override
   Widget build(BuildContext context) {
@@ -1004,13 +1095,7 @@ class RecipeDetailScreen extends StatelessWidget {
               title: Text(
                 recipe.name,
                 style: const TextStyle(
-                  shadows: [
-                    Shadow(
-                      offset: Offset(0, 1),
-                      blurRadius: 3.0,
-                      color: Colors.black54,
-                    ),
-                  ],
+                  shadows: [Shadow(offset: Offset(0, 1), blurRadius: 3.0, color: Colors.black54)],
                 ),
               ),
               background: recipe.imageUrl != null
@@ -1028,11 +1113,7 @@ class RecipeDetailScreen extends StatelessWidget {
               )
                   : Container(
                 color: Theme.of(context).colorScheme.primaryContainer,
-                child: Icon(
-                  Icons.restaurant_menu,
-                  size: 120,
-                  color: Theme.of(context).colorScheme.primary,
-                ),
+                child: Icon(Icons.restaurant_menu, size: 120, color: Theme.of(context).colorScheme.primary),
               ),
             ),
             actions: [
@@ -1041,13 +1122,7 @@ class RecipeDetailScreen extends StatelessWidget {
                 icon: Icon(
                   recipe.isFavorite ? Icons.favorite : Icons.favorite_border,
                   color: recipe.isFavorite ? Colors.red : Colors.white,
-                  shadows: const [
-                    Shadow(
-                      offset: Offset(0, 1),
-                      blurRadius: 3.0,
-                      color: Colors.black54,
-                    ),
-                  ],
+                  shadows: const [Shadow(offset: Offset(0, 1), blurRadius: 3.0, color: Colors.black54)],
                 ),
               ),
             ],
@@ -1061,86 +1136,42 @@ class RecipeDetailScreen extends StatelessWidget {
                   Wrap(
                     spacing: 8,
                     children: [
-                      Chip(
-                        label: Text(recipe.category),
-                        avatar: const Icon(Icons.category, size: 18),
-                      ),
-                      Chip(
-                        label: Text('${recipe.prepTime} min'),
-                        avatar: const Icon(Icons.access_time, size: 18),
-                      ),
-                      Chip(
-                        label: Text(recipe.difficulty),
-                        avatar: const Icon(Icons.signal_cellular_alt, size: 18),
-                      ),
+                      Chip(label: Text(recipe.category), avatar: const Icon(Icons.category, size: 18)),
+                      Chip(label: Text('${recipe.prepTime} min'), avatar: const Icon(Icons.access_time, size: 18)),
+                      Chip(label: Text(recipe.difficulty), avatar: const Icon(Icons.signal_cellular_alt, size: 18)),
                     ],
                   ),
                   const SizedBox(height: 16),
-                  Text(
-                    'Description',
-                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
+                  Text('Description', style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold)),
                   const SizedBox(height: 8),
-                  Text(
-                    recipe.description,
-                    style: Theme.of(context).textTheme.bodyLarge,
-                  ),
+                  Text(recipe.description, style: Theme.of(context).textTheme.bodyLarge),
                   const SizedBox(height: 24),
-                  Text(
-                    'Ingredients',
-                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
+                  Text('Ingredients', style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold)),
                   const SizedBox(height: 8),
-                  ...recipe.ingredients.map(
-                        (ingredient) => Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 4),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.circle, size: 8),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              ingredient,
-                              style: Theme.of(context).textTheme.bodyLarge,
-                            ),
-                          ),
-                        ],
-                      ),
+                  ...recipe.ingredients.map((ingredient) => Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.circle, size: 8),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(ingredient, style: Theme.of(context).textTheme.bodyLarge)),
+                      ],
                     ),
-                  ),
+                  )),
                   const SizedBox(height: 24),
-                  Text(
-                    'Instructions',
-                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
+                  Text('Instructions', style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold)),
                   const SizedBox(height: 8),
-                  ...recipe.instructions.asMap().entries.map(
-                        (entry) => Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      child: Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          CircleAvatar(
-                            radius: 16,
-                            child: Text('${entry.key + 1}'),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Text(
-                              entry.value,
-                              style: Theme.of(context).textTheme.bodyLarge,
-                            ),
-                          ),
-                        ],
-                      ),
+                  ...recipe.instructions.asMap().entries.map((entry) => Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        CircleAvatar(radius: 16, child: Text('${entry.key + 1}')),
+                        const SizedBox(width: 12),
+                        Expanded(child: Text(entry.value, style: Theme.of(context).textTheme.bodyLarge)),
+                      ],
                     ),
-                  ),
+                  )),
                   const SizedBox(height: 32),
                 ],
               ),
@@ -1171,35 +1202,18 @@ class FavoritesScreen extends StatelessWidget {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(
-              Icons.favorite_border,
-              size: 80,
-              color: Colors.grey[400],
-            ),
+            Icon(Icons.favorite_border, size: 80, color: Colors.grey[400]),
             const SizedBox(height: 16),
-            Text(
-              'No favorite recipes yet',
-              style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                color: Colors.grey[600],
-              ),
-            ),
+            Text('No favorite recipes yet', style: Theme.of(context).textTheme.titleLarge?.copyWith(color: Colors.grey[600])),
             const SizedBox(height: 8),
-            Text(
-              'Add recipes to favorites to see them here',
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                color: Colors.grey[500],
-              ),
-            ),
+            Text('Add recipes to favorites to see them here', style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.grey[500])),
           ],
         ),
       )
           : ListView.builder(
         padding: const EdgeInsets.all(16),
         itemCount: favoriteRecipes.length,
-        itemBuilder: (context, index) {
-          final recipe = favoriteRecipes[index];
-          return RecipeCard(recipe: recipe);
-        },
+        itemBuilder: (context, index) => RecipeCard(recipe: favoriteRecipes[index]),
       ),
     );
   }
