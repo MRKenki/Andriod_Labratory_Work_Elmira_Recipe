@@ -1,23 +1,37 @@
 name: recipe_book
-description: A recipe book application built with Flutter
+description: A recipe book Flutter application
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.0.0+6
 
 environment:
-  sdk: '>=3.0.0 <4.0.0'
+  sdk: ">=3.0.0 <4.0.0"
+
 
 dependencies:
   flutter:
     sdk: flutter
-  cupertino_icons: ^1.0.2
+
+
   provider: ^6.1.1
+
+
   http: ^1.1.0
+
+
   cached_network_image: ^3.3.0
+
+
+  sqflite: ^2.3.0
+  path: ^1.8.3
+  shared_preferences: ^2.2.2
+
+  cupertino_icons: ^1.0.2
+
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^2.0.0
+  flutter_lints: ^3.0.0
 
 flutter:
   uses-material-design: true

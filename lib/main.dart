@@ -3,11 +3,22 @@ import 'package:provider/provider.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final preferences = await SharedPreferences.getInstance();
+
   runApp(
-    ChangeNotifierProvider(
-      create: (context) => RecipeViewModel(),
+    MultiProvider(
+      providers: [
+        ChangeNotifierProvider(
+          create: (context) => RecipeViewModel(preferences),
+        ),
+        ChangeNotifierProvider(
+          create: (context) => SettingsViewModel(preferences),
+        ),
+      ],
       child: const RecipeBookApp(),
     ),
   );
@@ -25,6 +36,7 @@ class Recipe {
   final List<String> instructions;
   final String? imageUrl;
   bool isFavorite;
+  final int createdAt;
 
   Recipe({
     required this.id,
@@ -37,7 +49,8 @@ class Recipe {
     required this.instructions,
     this.imageUrl,
     this.isFavorite = false,
-  });
+    int? createdAt,
+  }) : createdAt = createdAt ?? DateTime.now().millisecondsSinceEpoch;
 
   factory Recipe.fromJson(Map<String, dynamic> json) {
     return Recipe(
@@ -46,11 +59,43 @@ class Recipe {
       category: json['strCategory'] ?? 'Other',
       prepTime: 30,
       difficulty: 'Medium',
-      description: json['strInstructions']?.substring(0, 100) ?? 'Delicious recipe',
+      description: json['strInstructions']?.substring(0, json['strInstructions'].length > 100 ? 100 : json['strInstructions'].length) ?? 'Delicious recipe',
       ingredients: _extractIngredients(json),
       instructions: _extractInstructions(json['strInstructions']),
       imageUrl: json['strMealThumb'],
       isFavorite: false,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'name': name,
+      'category': category,
+      'prepTime': prepTime,
+      'difficulty': difficulty,
+      'description': description,
+      'ingredients': ingredients,
+      'instructions': instructions,
+      'imageUrl': imageUrl,
+      'isFavorite': isFavorite,
+      'createdAt': createdAt,
+    };
+  }
+
+  factory Recipe.fromJsonStorage(Map<String, dynamic> json) {
+    return Recipe(
+      id: json['id'],
+      name: json['name'],
+      category: json['category'],
+      prepTime: json['prepTime'],
+      difficulty: json['difficulty'],
+      description: json['description'],
+      ingredients: List<String>.from(json['ingredients']),
+      instructions: List<String>.from(json['instructions']),
+      imageUrl: json['imageUrl'],
+      isFavorite: json['isFavorite'] ?? false,
+      createdAt: json['createdAt'],
     );
   }
 
@@ -59,7 +104,7 @@ class Recipe {
     for (int i = 1; i <= 20; i++) {
       final ingredient = json['strIngredient$i'];
       final measure = json['strMeasure$i'];
-      if (ingredient != null && ingredient.toString().isNotEmpty) {
+      if (ingredient != null && ingredient.toString().trim().isNotEmpty) {
         ingredients.add('$measure $ingredient'.trim());
       }
     }
@@ -86,7 +131,7 @@ class RecipeApiService {
     try {
       final response = await http.get(
         Uri.parse('$baseUrl/search.php?s=$query'),
-      );
+      ).timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
@@ -107,13 +152,16 @@ class RecipeApiService {
     try {
       final response = await http.get(
         Uri.parse('$baseUrl/filter.php?c=$category'),
-      );
+      ).timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
         if (data['meals'] != null) {
+          // Берем только первые 10 рецептов для ускорения
+          final meals = (data['meals'] as List).take(10);
           List<Recipe> recipes = [];
-          for (var meal in data['meals']) {
+
+          for (var meal in meals) {
             final detailedRecipe = await getRecipeDetails(meal['idMeal']);
             if (detailedRecipe != null) {
               recipes.add(detailedRecipe);
@@ -133,7 +181,7 @@ class RecipeApiService {
     try {
       final response = await http.get(
         Uri.parse('$baseUrl/lookup.php?i=$id'),
-      );
+      ).timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
@@ -148,46 +196,60 @@ class RecipeApiService {
     }
   }
 
+  // Параллельные запросы вместо последовательных
   Future<List<Recipe>> getRandomRecipes({int count = 10}) async {
-    List<Recipe> recipes = [];
-    for (int i = 0; i < count; i++) {
-      try {
-        final response = await http.get(
-          Uri.parse('$baseUrl/random.php'),
-        );
+    try {
+      // Делаем все запросы параллельно
+      final futures = List.generate(
+        count,
+            (_) => http.get(Uri.parse('$baseUrl/random.php'))
+            .timeout(const Duration(seconds: 10)),
+      );
 
+      final responses = await Future.wait(futures);
+      List<Recipe> recipes = [];
+
+      for (var response in responses) {
         if (response.statusCode == 200) {
           final data = json.decode(response.body);
           if (data['meals'] != null && data['meals'].isNotEmpty) {
             recipes.add(Recipe.fromJson(data['meals'][0]));
           }
         }
-      } catch (e) {
-        print('Error fetching random recipe: $e');
       }
+      return recipes;
+    } catch (e) {
+      print('Error fetching random recipes: $e');
+      return [];
     }
-    return recipes;
   }
 }
 
 // ViewModel
 class RecipeViewModel extends ChangeNotifier {
+  final SharedPreferences _preferences;
   final RecipeApiService _apiService = RecipeApiService();
+
   List<Recipe> _recipes = [];
   List<Recipe> _searchResults = [];
+  List<Recipe> _favoriteRecipes = [];
   bool _isLoading = false;
   String? _errorMessage;
   String _selectedCategory = 'All';
 
+  RecipeViewModel(this._preferences) {
+    _selectedCategory = _preferences.getString('lastCategory') ?? 'All';
+    _loadFavoritesFromPrefs();
+    loadRecipes();
+  }
+
   List<Recipe> get recipes => _recipes;
   List<Recipe> get searchResults => _searchResults;
+  List<Recipe> get favoriteRecipes => _favoriteRecipes;
   bool get isLoading => _isLoading;
   String? get errorMessage => _errorMessage;
   String get selectedCategory => _selectedCategory;
-
-  List<Recipe> get favoriteRecipes =>
-      _recipes.where((r) => r.isFavorite).toList();
-  int get favoriteCount => favoriteRecipes.length;
+  int get favoriteCount => _favoriteRecipes.length;
 
   final List<String> categories = [
     'All',
@@ -201,8 +263,35 @@ class RecipeViewModel extends ChangeNotifier {
     'Vegetarian',
   ];
 
-  RecipeViewModel() {
-    loadRecipes();
+  // Используем SharedPreferences вместо SQLite потому что на Web нормально не работает
+  void _loadFavoritesFromPrefs() {
+    try {
+      final favoritesJson = _preferences.getString('favorites');
+      if (favoritesJson != null) {
+        final List<dynamic> favoritesList = json.decode(favoritesJson);
+        _favoriteRecipes = favoritesList
+            .map((item) => Recipe.fromJsonStorage(item))
+            .toList();
+      }
+    } catch (e) {
+      print('Error loading favorites: $e');
+      _favoriteRecipes = [];
+    }
+  }
+
+  Future<void> _saveFavoritesToPrefs() async {
+    try {
+      final favoritesJson = json.encode(
+        _favoriteRecipes.map((r) => r.toJson()).toList(),
+      );
+      await _preferences.setString('favorites', favoritesJson);
+    } catch (e) {
+      print('Error saving favorites: $e');
+    }
+  }
+
+  bool _isFavorite(String id) {
+    return _favoriteRecipes.any((fav) => fav.id == id);
   }
 
   Future<void> loadRecipes() async {
@@ -212,6 +301,12 @@ class RecipeViewModel extends ChangeNotifier {
 
     try {
       _recipes = await _apiService.getRandomRecipes(count: 10);
+
+
+      for (var recipe in _recipes) {
+        recipe.isFavorite = _isFavorite(recipe.id);
+      }
+
       _isLoading = false;
       notifyListeners();
     } catch (e) {
@@ -223,6 +318,8 @@ class RecipeViewModel extends ChangeNotifier {
 
   Future<void> loadRecipesByCategory(String category) async {
     _selectedCategory = category;
+    await _preferences.setString('lastCategory', category);
+
     _isLoading = true;
     _errorMessage = null;
     notifyListeners();
@@ -233,6 +330,12 @@ class RecipeViewModel extends ChangeNotifier {
       } else {
         _recipes = await _apiService.getRecipesByCategory(category);
       }
+
+
+      for (var recipe in _recipes) {
+        recipe.isFavorite = _isFavorite(recipe.id);
+      }
+
       _isLoading = false;
       notifyListeners();
     } catch (e) {
@@ -255,6 +358,12 @@ class RecipeViewModel extends ChangeNotifier {
 
     try {
       _searchResults = await _apiService.searchRecipes(query);
+
+
+      for (var recipe in _searchResults) {
+        recipe.isFavorite = _isFavorite(recipe.id);
+      }
+
       _isLoading = false;
       notifyListeners();
     } catch (e) {
@@ -269,12 +378,32 @@ class RecipeViewModel extends ChangeNotifier {
     notifyListeners();
   }
 
-  void toggleFavorite(String recipeId) {
-    final recipe = _recipes.firstWhere(
-          (r) => r.id == recipeId,
-      orElse: () => _searchResults.firstWhere((r) => r.id == recipeId),
-    );
+  Future<void> toggleFavorite(String recipeId) async {
+    Recipe? recipe;
+
+    try {
+      recipe = _recipes.firstWhere((r) => r.id == recipeId);
+    } catch (e) {
+      try {
+        recipe = _searchResults.firstWhere((r) => r.id == recipeId);
+      } catch (e) {
+        try {
+          recipe = _favoriteRecipes.firstWhere((r) => r.id == recipeId);
+        } catch (e) {
+          return;
+        }
+      }
+    }
+
     recipe.isFavorite = !recipe.isFavorite;
+
+    if (recipe.isFavorite) {
+      _favoriteRecipes.add(recipe);
+    } else {
+      _favoriteRecipes.removeWhere((r) => r.id == recipe!.id);
+    }
+
+    await _saveFavoritesToPrefs();
     notifyListeners();
   }
 
@@ -285,9 +414,39 @@ class RecipeViewModel extends ChangeNotifier {
       try {
         return _searchResults.firstWhere((r) => r.id == id);
       } catch (e) {
-        return null;
+        try {
+          return _favoriteRecipes.firstWhere((r) => r.id == id);
+        } catch (e) {
+          return null;
+        }
       }
     }
+  }
+}
+
+// Settings ViewModel
+class SettingsViewModel extends ChangeNotifier {
+  final SharedPreferences _preferences;
+  bool _isDarkMode;
+  bool _isGridView;
+
+  SettingsViewModel(this._preferences)
+      : _isDarkMode = _preferences.getBool('isDarkMode') ?? false,
+        _isGridView = _preferences.getBool('isGridView') ?? false;
+
+  bool get isDarkMode => _isDarkMode;
+  bool get isGridView => _isGridView;
+
+  Future<void> toggleDarkMode() async {
+    _isDarkMode = !_isDarkMode;
+    await _preferences.setBool('isDarkMode', _isDarkMode);
+    notifyListeners();
+  }
+
+  Future<void> toggleGridView() async {
+    _isGridView = !_isGridView;
+    await _preferences.setBool('isGridView', _isGridView);
+    notifyListeners();
   }
 }
 
@@ -297,6 +456,8 @@ class RecipeBookApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final settingsViewModel = context.watch<SettingsViewModel>();
+
     return MaterialApp(
       title: 'Recipe Book',
       theme: ThemeData(
@@ -316,11 +477,30 @@ class RecipeBookApp extends StatelessWidget {
           elevation: 0,
         ),
       ),
+      darkTheme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.deepOrange,
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
+        cardTheme: CardThemeData(
+          elevation: 2,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+        ),
+        appBarTheme: const AppBarTheme(
+          centerTitle: true,
+          elevation: 0,
+        ),
+      ),
+      themeMode: settingsViewModel.isDarkMode ? ThemeMode.dark : ThemeMode.light,
       initialRoute: '/',
       routes: {
         '/': (context) => const MainNavigationScreen(),
         '/favorites': (context) => const FavoritesScreen(),
         '/search': (context) => const SearchScreen(),
+        '/settings': (context) => const SettingsScreen(),
       },
       onGenerateRoute: (settings) {
         if (settings.name == '/recipe') {
@@ -386,6 +566,7 @@ class HomeScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final viewModel = context.watch<RecipeViewModel>();
+    final settingsViewModel = context.watch<SettingsViewModel>();
     final isTablet = MediaQuery.of(context).size.width > 600;
 
     return Scaffold(
@@ -398,6 +579,12 @@ class HomeScreen extends StatelessWidget {
               Navigator.pushNamed(context, '/search');
             },
             icon: const Icon(Icons.search),
+          ),
+          IconButton(
+            onPressed: () {
+              Navigator.pushNamed(context, '/settings');
+            },
+            icon: const Icon(Icons.settings),
           ),
           Center(
             child: Padding(
@@ -459,7 +646,7 @@ class HomeScreen extends StatelessWidget {
             )
                 : viewModel.recipes.isEmpty
                 ? const Center(child: Text('No recipes found'))
-                : isTablet
+                : (settingsViewModel.isGridView || isTablet)
                 ? _buildGridView(context, viewModel)
                 : _buildListView(context, viewModel),
           ),
@@ -724,6 +911,63 @@ class _SearchScreenState extends State<SearchScreen> {
           final recipe = viewModel.searchResults[index];
           return RecipeCard(recipe: recipe);
         },
+      ),
+    );
+  }
+}
+
+// Settings Screen
+class SettingsScreen extends StatelessWidget {
+  const SettingsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final settingsViewModel = context.watch<SettingsViewModel>();
+
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        title: const Text('Settings'),
+      ),
+      body: ListView(
+        children: [
+          SwitchListTile(
+            title: const Text('Dark Mode'),
+            subtitle: const Text('Enable dark theme'),
+            value: settingsViewModel.isDarkMode,
+            onChanged: (_) => settingsViewModel.toggleDarkMode(),
+            secondary: Icon(
+              settingsViewModel.isDarkMode ? Icons.dark_mode : Icons.light_mode,
+            ),
+          ),
+          const Divider(),
+          SwitchListTile(
+            title: const Text('Grid View'),
+            subtitle: const Text('Display recipes in grid layout'),
+            value: settingsViewModel.isGridView,
+            onChanged: (_) => settingsViewModel.toggleGridView(),
+            secondary: Icon(
+              settingsViewModel.isGridView ? Icons.grid_view : Icons.view_list,
+            ),
+          ),
+          const Divider(),
+          ListTile(
+            leading: const Icon(Icons.info_outline),
+            title: const Text('About'),
+            subtitle: const Text('Recipe Book v1.0.0 (Web)'),
+            onTap: () {
+              showAboutDialog(
+                context: context,
+                applicationName: 'Recipe Book',
+                applicationVersion: '1.0.0 (Web)',
+                applicationIcon: const Icon(Icons.restaurant_menu, size: 48),
+                children: [
+                  const Text('A beautiful recipe book application built with Flutter for Web'),
+                ],
+              );
+            },
+          ),
+        ],
       ),
     );
   }
