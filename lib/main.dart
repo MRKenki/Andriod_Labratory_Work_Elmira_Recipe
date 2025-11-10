@@ -20,8 +20,34 @@ class RecipeBookApp extends StatelessWidget {
   }
 }
 
-class HomeScreen extends StatelessWidget {
+class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  int _favoriteCount = 0;
+  bool _isLiked = false;
+
+  void _toggleLike() {
+    setState(() {
+      _isLiked = !_isLiked;
+      if (_isLiked) {
+        _favoriteCount++;
+      } else {
+        _favoriteCount--;
+      }
+    });
+  }
+
+  void _resetCounter() {
+    setState(() {
+      _favoriteCount = 0;
+      _isLiked = false;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -29,12 +55,25 @@ class HomeScreen extends StatelessWidget {
       appBar: AppBar(
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         title: const Text('Recipe Book'),
+        actions: [
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.only(right: 16),
+              child: Text(
+                'Favorites: $_favoriteCount',
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            // Image placeholder
             Container(
               width: 200,
               height: 200,
@@ -42,14 +81,13 @@ class HomeScreen extends StatelessWidget {
                 color: Colors.grey[300],
                 borderRadius: BorderRadius.circular(16),
               ),
-              child: const Icon(
+              child: Icon(
                 Icons.restaurant_menu,
                 size: 100,
-                color: Colors.deepOrange,
+                color: _isLiked ? Colors.red : Colors.deepOrange,
               ),
             ),
             const SizedBox(height: 24),
-            // Text elements
             const Text(
               'Welcome to Recipe Book',
               style: TextStyle(
@@ -68,6 +106,37 @@ class HomeScreen extends StatelessWidget {
                 ),
                 textAlign: TextAlign.center,
               ),
+            ),
+            const SizedBox(height: 32),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                ElevatedButton.icon(
+                  onPressed: _toggleLike,
+                  icon: Icon(_isLiked ? Icons.favorite : Icons.favorite_border),
+                  label: Text(_isLiked ? 'Liked' : 'Like'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _isLiked ? Colors.red : null,
+                    foregroundColor: _isLiked ? Colors.white : null,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 24,
+                      vertical: 12,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 16),
+                OutlinedButton.icon(
+                  onPressed: _resetCounter,
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Reset'),
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 24,
+                      vertical: 12,
+                    ),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
