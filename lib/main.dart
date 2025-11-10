@@ -5,6 +5,7 @@ import 'dart:convert';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:webview_flutter/webview_flutter.dart';
 
 
 @pragma('vm:entry-point')
@@ -18,7 +19,6 @@ void main() async {
 
   if (!kIsWeb) {
     try {
-      // Динамический импорт WorkManager только для не-Web платформ
       print('WorkManager инициализация пропущена на Web');
     } catch (e) {
       print('WorkManager не доступен на этой платформе');
@@ -51,6 +51,7 @@ class Recipe {
   final List<String> ingredients;
   final List<String> instructions;
   final String? imageUrl;
+  final String? sourceUrl; // NEW: URL источника рецепта
   bool isFavorite;
   final int createdAt;
 
@@ -64,6 +65,7 @@ class Recipe {
     required this.ingredients,
     required this.instructions,
     this.imageUrl,
+    this.sourceUrl, // NEW
     this.isFavorite = false,
     int? createdAt,
   }) : createdAt = createdAt ?? DateTime.now().millisecondsSinceEpoch;
@@ -79,6 +81,7 @@ class Recipe {
       ingredients: _extractIngredients(json),
       instructions: _extractInstructions(json['strInstructions']),
       imageUrl: json['strMealThumb'],
+      sourceUrl: json['strSource'], // NEW: Берем URL источника из API
       isFavorite: false,
     );
   }
@@ -94,6 +97,7 @@ class Recipe {
       'ingredients': ingredients,
       'instructions': instructions,
       'imageUrl': imageUrl,
+      'sourceUrl': sourceUrl, // NEW
       'isFavorite': isFavorite,
       'createdAt': createdAt,
     };
@@ -110,6 +114,7 @@ class Recipe {
       ingredients: List<String>.from(json['ingredients']),
       instructions: List<String>.from(json['instructions']),
       imageUrl: json['imageUrl'],
+      sourceUrl: json['sourceUrl'], // NEW
       isFavorite: json['isFavorite'] ?? false,
       createdAt: json['createdAt'],
     );
@@ -309,11 +314,9 @@ class RecipeViewModel extends ChangeNotifier {
           final recipeData = json.decode(recipeJson);
           _recipeOfTheDay = Recipe.fromJsonStorage(recipeData);
         } else {
-          // Если рецепт устарел, загружаем новый
           _fetchNewRecipeOfTheDay();
         }
       } else {
-        // Если рецепта нет, загружаем новый
         _fetchNewRecipeOfTheDay();
       }
     } catch (e) {
@@ -322,7 +325,6 @@ class RecipeViewModel extends ChangeNotifier {
     }
   }
 
-  // Загрузка нового рецепта дня
   Future<void> _fetchNewRecipeOfTheDay() async {
     try {
       final recipes = await _apiService.getRandomRecipes(count: 1);
@@ -330,7 +332,6 @@ class RecipeViewModel extends ChangeNotifier {
         _recipeOfTheDay = recipes[0];
         _recipeOfTheDay!.isFavorite = _isFavorite(_recipeOfTheDay!.id);
 
-        // Сохраняем в SharedPreferences
         final recipeJson = json.encode(_recipeOfTheDay!.toJson());
         await _preferences.setString('recipe_of_the_day', recipeJson);
         await _preferences.setString('recipe_of_the_day_date', DateTime.now().toIso8601String());
@@ -441,7 +442,6 @@ class RecipeViewModel extends ChangeNotifier {
   Future<void> toggleFavorite(String recipeId) async {
     Recipe? foundRecipe;
 
-    // Ищем рецепт во всех источниках
     try {
       foundRecipe = _recipes.firstWhere((r) => r.id == recipeId);
     } catch (e) {
@@ -458,10 +458,8 @@ class RecipeViewModel extends ChangeNotifier {
       }
     }
 
-    // Если рецепт не найден, выходим
     if (foundRecipe == null) return;
 
-    // Теперь foundRecipe точно не null, работаем с ним
     foundRecipe.isFavorite = !foundRecipe.isFavorite;
 
     if (foundRecipe.isFavorite) {
@@ -579,6 +577,16 @@ class RecipeBookApp extends StatelessWidget {
             builder: (context) => RecipeDetailScreen(recipeId: recipeId),
           );
         }
+        // NEW: Route для WebView
+        if (settings.name == '/webview') {
+          final args = settings.arguments as Map<String, String>;
+          return MaterialPageRoute(
+            builder: (context) => RecipeWebViewScreen(
+              url: args['url']!,
+              title: args['title']!,
+            ),
+          );
+        }
         return null;
       },
     );
@@ -666,7 +674,6 @@ class HomeScreen extends StatelessWidget {
       ),
       body: Column(
         children: [
-          // Recipe of the Day Banner
           if (viewModel.recipeOfTheDay != null)
             Container(
               margin: const EdgeInsets.all(16),
@@ -744,7 +751,6 @@ class HomeScreen extends StatelessWidget {
                 ),
               ),
             ),
-          // Category Filter
           SizedBox(
             height: 60,
             child: ListView.builder(
@@ -765,7 +771,6 @@ class HomeScreen extends StatelessWidget {
               },
             ),
           ),
-          // Recipe List
           Expanded(
             child: viewModel.isLoading
                 ? const Center(child: CircularProgressIndicator())
@@ -1045,24 +1050,184 @@ class SettingsScreen extends StatelessWidget {
           ListTile(
             leading: const Icon(Icons.info_outline),
             title: const Text('About'),
-            subtitle: const Text('Recipe Book v1.1.0 (Unit 7 - Web)'),
+            subtitle: const Text('Recipe Book v1.2.0 (Unit 8 - Platform Views)'),
             onTap: () {
               showAboutDialog(
                 context: context,
                 applicationName: 'Recipe Book',
-                applicationVersion: '1.1.0 (Unit 7 - Daily Recipe)',
+                applicationVersion: '1.2.0 (Unit 8 - Platform Views)',
                 applicationIcon: const Icon(Icons.restaurant_menu, size: 48),
                 children: const [
-                  Text('A recipe book app with Recipe of the Day'),
+                  Text('A recipe book app with native web view integration'),
                   SizedBox(height: 8),
-                  Text('✓ Daily featured recipe'),
-                  Text('✓ Automatic recipe refresh'),
+                  Text('✓ View recipes online with WebView'),
+                  Text('✓ Platform Views interoperability'),
                 ],
               );
             },
           ),
         ],
       ),
+    );
+  }
+}
+
+// NEW: Recipe WebView Screen (Platform View Integration)
+class RecipeWebViewScreen extends StatefulWidget {
+  final String url;
+  final String title;
+
+  const RecipeWebViewScreen({
+    super.key,
+    required this.url,
+    required this.title,
+  });
+
+  @override
+  State<RecipeWebViewScreen> createState() => _RecipeWebViewScreenState();
+}
+
+class _RecipeWebViewScreenState extends State<RecipeWebViewScreen> {
+  WebViewController? _controller;
+  bool _isLoading = true;
+  bool _hasError = false;
+  double _progress = 0;
+  String? _errorMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeWebView();
+  }
+
+  void _initializeWebView() {
+    try {
+      _controller = WebViewController()
+        ..setJavaScriptMode(JavaScriptMode.unrestricted)
+        ..setBackgroundColor(Colors.white)
+        ..setNavigationDelegate(
+          NavigationDelegate(
+            onProgress: (int progress) {
+              if (mounted) {
+                setState(() {
+                  _progress = progress / 100;
+                });
+              }
+            },
+            onPageStarted: (String url) {
+              if (mounted) {
+                setState(() {
+                  _isLoading = true;
+                  _hasError = false;
+                });
+              }
+            },
+            onPageFinished: (String url) {
+              if (mounted) {
+                setState(() {
+                  _isLoading = false;
+                });
+              }
+            },
+            onWebResourceError: (WebResourceError error) {
+              if (mounted) {
+                setState(() {
+                  _isLoading = false;
+                  _hasError = true;
+                  _errorMessage = error.description;
+                });
+              }
+              print('WebView error: ${error.description}');
+            },
+          ),
+        )
+        ..loadRequest(Uri.parse(widget.url));
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _hasError = true;
+          _errorMessage = e.toString();
+        });
+      }
+      print('WebView initialization error: $e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(
+          widget.title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        actions: [
+          if (_controller != null)
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              onPressed: () {
+                _controller!.reload();
+                setState(() {
+                  _hasError = false;
+                  _isLoading = true;
+                });
+              },
+            ),
+        ],
+        bottom: _isLoading && !_hasError
+            ? PreferredSize(
+          preferredSize: const Size.fromHeight(3),
+          child: LinearProgressIndicator(value: _progress),
+        )
+            : null,
+      ),
+      body: _hasError
+          ? Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(
+                Icons.error_outline,
+                size: 64,
+                color: Colors.red,
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'Unable to load webpage',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                _errorMessage ?? 'Unknown error',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.grey[600]),
+              ),
+              const SizedBox(height: 24),
+              ElevatedButton.icon(
+                onPressed: () {
+                  _initializeWebView();
+                },
+                icon: const Icon(Icons.refresh),
+                label: const Text('Retry'),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Go Back'),
+              ),
+            ],
+          ),
+        ),
+      )
+          : _controller != null
+          ? WebViewWidget(controller: _controller!)
+          : const Center(child: CircularProgressIndicator()),
     );
   }
 }
@@ -1117,6 +1282,28 @@ class RecipeDetailScreen extends StatelessWidget {
               ),
             ),
             actions: [
+              // NEW: View Online button for Platform View integration
+              if (recipe.sourceUrl != null && recipe.sourceUrl!.isNotEmpty)
+                IconButton(
+                  icon: const Icon(Icons.public),
+                  tooltip: 'View Online',
+                  onPressed: () {
+                    try {
+                      Navigator.pushNamed(
+                        context,
+                        '/webview',
+                        arguments: {
+                          'url': recipe.sourceUrl!,
+                          'title': recipe.name,
+                        },
+                      );
+                    } catch (e) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Error opening webpage: $e')),
+                      );
+                    }
+                  },
+                ),
               IconButton(
                 onPressed: () => viewModel.toggleFavorite(recipe.id),
                 icon: Icon(
@@ -1141,6 +1328,34 @@ class RecipeDetailScreen extends StatelessWidget {
                       Chip(label: Text(recipe.difficulty), avatar: const Icon(Icons.signal_cellular_alt, size: 18)),
                     ],
                   ),
+                  // NEW: View Online button (prominent)
+                  if (recipe.sourceUrl != null && recipe.sourceUrl!.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      child: ElevatedButton.icon(
+                        onPressed: () {
+                          try {
+                            Navigator.pushNamed(
+                              context,
+                              '/webview',
+                              arguments: {
+                                'url': recipe.sourceUrl!,
+                                'title': recipe.name,
+                              },
+                            );
+                          } catch (e) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(content: Text('Error opening webpage: $e')),
+                            );
+                          }
+                        },
+                        icon: const Icon(Icons.language),
+                        label: const Text('View Full Recipe Online'),
+                        style: ElevatedButton.styleFrom(
+                          minimumSize: const Size(double.infinity, 48),
+                        ),
+                      ),
+                    ),
                   const SizedBox(height: 16),
                   Text('Description', style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold)),
                   const SizedBox(height: 8),
